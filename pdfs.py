@@ -57,6 +57,12 @@ VOLUME_INDICATORS = [
 
 #     return unquote(filename)
 
+MAX_FILENAME_LENGTH = 100  # safe limit
+
+def shorten_filename(name):
+    if len(name) > MAX_FILENAME_LENGTH:
+        name = name[:MAX_FILENAME_LENGTH] + '...'
+    return name
 
 async def get_filename_from_response(response):
     content_disposition = response.headers.get("Content-Disposition", "")
@@ -67,20 +73,20 @@ async def get_filename_from_response(response):
         filename_encoded = match.group(1)
         filename = unquote(filename_encoded)
         logger.info(f"Extracted filename from filename*=: {filename}")
-        return filename
+        return shorten_filename(filename)
 
     # Fallback to old filename= (may be broken)
     match = re.search(r'filename="?(.*?)"?($|;)', content_disposition)
     if match:
         filename = match.group(1)
         logger.warning(f"Extracted filename from fallback filename=: {filename}")
-        return filename
+        return shorten_filename(filename)
 
     # Final fallback to URL
     url_path = urlparse(str(response.url)).path
     filename = os.path.basename(url_path)
     logger.warning(f"Extracted filename from URL: {filename}")
-    return filename
+    return shorten_filename(filename)
 
 
 async def get_file_extension(response, url):
@@ -106,7 +112,7 @@ async def get_file_extension(response, url):
     
     return extension
 
-async def download_file(session, url, destination_dir, link_name=None):
+# async def download_file(session, url, destination_dir, link_name=None):
     """Download a file asynchronously and save it to the destination directory"""
     try:
         async with session.get(url) as response:
@@ -149,6 +155,77 @@ async def download_file(session, url, destination_dir, link_name=None):
                 return False, None
     except Exception as e:
         logger.error(f"Error downloading {url}: {str(e)}")
+        return False, None
+
+
+
+
+
+async def retry_with_backoff(coro_func, max_retries=3, initial_delay=2, backoff_factor=2):
+    delay = initial_delay
+    for attempt in range(max_retries):
+        try:
+            return await coro_func()
+        except Exception as e:
+            if attempt < max_retries - 1:
+                logger.warning(f"Retry {attempt + 1} failed. Retrying in {delay}s... Error: {e}")
+                await asyncio.sleep(delay)
+                delay *= backoff_factor
+            else:
+                raise e
+            
+
+MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024 * 1024  # 20 GB
+
+async def download_file(session, url, destination_dir, link_name=None):
+    """Download a file asynchronously with retries, timeouts, chunked writing, and size check"""
+
+    async def attempt():
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as response:
+            if response.status != 200:
+                raise Exception(f"Non-200 response: {response.status}")
+
+            # Check content size
+            content_length = response.headers.get('Content-Length')
+            if content_length:
+                file_size = int(content_length)
+                if file_size > MAX_FILE_SIZE_BYTES:
+                    logger.warning(f"Skipped {url} — File too large ({file_size / (1024**3):.2f} GB)")
+                    return False, None
+            else:
+                logger.info(f"No Content-Length header for {url}. Proceeding anyway.")
+
+            # Get filename from headers or fallback
+            filename = await get_filename_from_response(response)
+            if not filename or filename == '':
+                extension = await get_file_extension(response, url)
+                if link_name:
+                    sanitized_link_name = re.sub(r'[\\/*?:"<>|]', '', link_name)
+                    filename = f"{sanitized_link_name}{extension}"
+                else:
+                    filename = f"file_{hash(url) % 10000}{extension}"
+
+            try:
+                filename.encode('utf-8')  # Force check
+            except UnicodeEncodeError:
+                filename = filename.encode('utf-8', 'ignore').decode('utf-8')
+                logger.error(f"Filename {filename} contained invalid characters. Cleaned fallback used.")
+
+            os.makedirs(destination_dir, exist_ok=True)
+            file_path = os.path.join(destination_dir, filename)
+
+            # Save file in chunks
+            with open(file_path, 'wb') as f:
+                async for chunk in response.content.iter_chunked(1024 * 64):  # 64KB chunks
+                    f.write(chunk)
+
+            logger.info(f"Downloaded {url} to {file_path}")
+            return True, file_path
+
+    try:
+        return await retry_with_backoff(attempt)
+    except Exception as e:
+        logger.error(f"Failed to download after retries: {url}. Error: {e}")
         return False, None
 
 
